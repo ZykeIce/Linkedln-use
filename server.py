@@ -139,7 +139,6 @@ async def lifespan(app: fastapi.FastAPI):
     tasks = []
     
     ensure_openbox_config()
-    await fix_script_permissions()
 
     # Start initial processes
     tasks.append(asyncio.create_task(

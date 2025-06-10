@@ -1,14 +1,6 @@
 [
   {
     "role": "user",
-    "content": "am i logged i?"
-  },
-  {
-    "role": "assistant",
-    "content": "<think>\n\n\nI should also consider if there's any other function needed, but the tools provided only include sign_out and check_login_status. Since the user isn't asking to sign out, just checking the status, so the correct tool here is check_login_status. \n\nNo need to ask for more information because the question is straightforward. Just call the function and then relay the result back to the user in a friendly manner. Let me structure the tool call properly.\n</think>\n\n<think>\n</think>\n\nYou are currently not logged in to LinkedIn. To manage Direct Messages or access your profile, please log in first. Would you like assistance with logging in or other LinkedIn activities?"
-  },
-  {
-    "role": "user",
-    "content": "can you read my DM"
+    "content": "can you read the whole conversation with minh huy"
   }
 ]

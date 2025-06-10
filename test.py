@@ -57,15 +57,33 @@ if __name__ == "__main__":
                 if chunk == b"[DONE]":
                     break
         
-                decoded_chunk = chunk.decode("utf-8")
-                json_chunk = json.loads(decoded_chunk)
-                content = json_chunk["choices"][0]["delta"]["content"]
-                role = json_chunk["choices"][0]["delta"]["role"]
-
-                print(content, end="", flush=True)
-
-                if role in [None, "assistant"]:
-                    assistant_message += content
+                try:
+                    decoded_chunk = chunk.decode("utf-8")
+                    json_chunk = json.loads(decoded_chunk)
+                    
+                    # Handle error responses
+                    if "error" in json_chunk:
+                        print(f"\nError: {json_chunk['error']}")
+                        break
+                        
+                    # Handle different response formats
+                    if "choices" in json_chunk:
+                        delta = json_chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        role = delta.get("role")
+                        
+                        if content:
+                            print(content, end="", flush=True)
+                            if role in [None, "assistant"]:
+                                assistant_message += content
+                    elif "message" in json_chunk:
+                        print(f"\nMessage: {json_chunk['message']}")
+                        
+                except json.JSONDecodeError:
+                    print(f"\nError decoding response: {decoded_chunk}")
+                except Exception as e:
+                    print(f"\nError processing response: {str(e)}")
+                    continue
 
         # Filter out the thinking part if present
         if assistant_message:
