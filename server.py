@@ -76,6 +76,19 @@ def ensure_openbox_config():
     number.text = "1"
     tree.write(openbox_config_file_path, encoding="utf-8", xml_declaration=True)
 
+async def fix_script_permissions():
+    """Fix line endings and permissions for shell scripts."""
+    script_path = 'scripts/x11-setup.sh'
+    # Read the file and convert CRLF to LF
+    with open(script_path, 'rb') as f:
+        content = f.read()
+    content = content.replace(b'\r\n', b'\n')
+    # Write back with LF endings
+    with open(script_path, 'wb') as f:
+        f.write(content)
+    # Make executable
+    os.chmod(script_path, 0o755)
+
 # retry a process until it done with exit code = 0 or forever auto restart it
 async def observe_process(command: str, app_signal: asyncio.Event, auto_restart: bool = True, restart_delay: float = 2):
     while not app_signal.is_set():
@@ -126,6 +139,7 @@ async def lifespan(app: fastapi.FastAPI):
     tasks = []
     
     ensure_openbox_config()
+    await fix_script_permissions()
 
     # Start initial processes
     tasks.append(asyncio.create_task(
