@@ -106,16 +106,23 @@ async def get_current_conversations(
             await page.goto('https://www.linkedin.com/messaging/', wait_until='domcontentloaded')
             
             # Try to find any messaging related element with shorter timeouts
-            for selector in ['.msg-conversations-container', '.msg-overlay-list-bubble']:
+            for selector in [
+                'div[data-test-id="messaging-thread-list"]',  # Latest 2024 selector
+                '.msg-conversations-container__conversations-list',
+                '.msg-conversations-container',
+                '.msg-overlay-list-bubble'
+            ]:
                 try:
                     await page.wait_for_selector(selector, timeout=3000)
                     break
                 except:
                     continue
 
-        # Try to find conversations immediately
+        # Try to find conversations with latest selectors
         conversations = []
         for selector in [
+            'div[data-test-id="messaging-thread"]',  # Latest 2024 selector
+            '.msg-conversation-card__message',
             'div.msg-conversation-listitem',
             '.msg-conversation-card',
             '.msg-overlay-list-bubble__convo-item'
@@ -127,14 +134,63 @@ async def get_current_conversations(
             except:
                 continue
 
-        # If no conversations found, try one quick reload
+        # If no conversations found, try GraphQL API
         if not conversations:
+            try:
+                # Get CSRF token
+                csrf_token = await page.evaluate("""
+                    document.cookie
+                        .split(';')
+                        .find(c => c.trim().startsWith('JSESSIONID'))
+                        ?.split('=')[1]
+                """)
+                
+                if csrf_token:
+                    # Try GraphQL API
+                    conversations_data = await page.evaluate("""
+                        async (token) => {
+                            try {
+                                const response = await fetch('https://www.linkedin.com/voyager/api/messaging/conversations', {
+                                    headers: {
+                                        'accept': 'application/vnd.linkedin.normalized+json+2.1',
+                                        'csrf-token': token,
+                                        'x-restli-protocol-version': '2.0.0'
+                                    },
+                                    credentials: 'include'
+                                });
+                                
+                                if (response.ok) {
+                                    const data = await response.json();
+                                    return data.elements;
+                                }
+                            } catch (e) {
+                                console.error('API error:', e);
+                            }
+                            return null;
+                        }
+                    """, csrf_token)
+                    
+                    if conversations_data:
+                        return response_model(result=[
+                            LinkedInMessage(
+                                conversation_id=conv.get('entityUrn', str(uuid.uuid4())),
+                                participant_name=conv.get('participants', [{}])[0].get('name', 'Unknown Contact'),
+                                message_preview=conv.get('previewText', ''),
+                                timestamp=conv.get('lastActivityAt', 'Recent')
+                            ) for conv in conversations_data[:limit]
+                        ])
+
+            except Exception as api_error:
+                logger.warning(f"GraphQL API attempt failed: {api_error}")
+
+            # If still no conversations, try one quick reload
             await page.reload(wait_until='domcontentloaded')
             await page.wait_for_timeout(1000)
             for selector in [
+                'div[data-test-id="messaging-thread"]',  # Latest 2024 selector
+                '.msg-conversation-card__message',
                 'div.msg-conversation-listitem',
-                '.msg-conversation-card',
-                '.msg-overlay-list-bubble__convo-item'
+                '.msg-conversation-card'
             ]:
                 try:
                     conversations = await page.query_selector_all(selector)
@@ -153,12 +209,14 @@ async def get_current_conversations(
                 break
 
             try:
-                # Get real conversation ID first
+                # Get conversation ID using latest selectors
                 conv_id = None
                 
                 # Method 1: Direct attribute
                 try:
-                    conv_id = await conv.get_attribute('data-conversation-id')
+                    conv_id = await conv.get_attribute('data-conversation-id') or \
+                             await conv.get_attribute('data-thread-id') or \
+                             await conv.get_attribute('data-test-conversation-id')  # Latest 2024 attribute
                 except:
                     pass
                     
@@ -171,21 +229,15 @@ async def get_current_conversations(
                             conv_id = href.split('/thread/')[-1].split('?')[0]
                     except:
                         pass
-                
-                # Method 3: From conversation card
-                if not conv_id:
-                    try:
-                        card = await conv.query_selector('.msg-conversation-card')
-                        if card:
-                            card_id = await card.get_attribute('id')
-                            if card_id:
-                                conv_id = card_id.replace('conversation-', '')
-                    except:
-                        pass
 
-                # Get participant name
+                # Get participant name using latest selectors
                 participant = None
-                for selector in ['.msg-conversation-card__participant-names', '.msg-overlay-bubble-header__title']:
+                for selector in [
+                    '[data-test-id="thread-participant-name"]',  # Latest 2024 selector
+                    '.msg-conversation-card__participant-names',
+                    '.msg-conversation-listitem__participant-names',
+                    '.msg-overlay-bubble-header__title'
+                ]:
                     try:
                         participant = await conv.eval_on_selector(selector, "el => el.innerText")
                         if participant:
@@ -193,9 +245,14 @@ async def get_current_conversations(
                     except:
                         continue
 
-                # Get message preview
+                # Get message preview using latest selectors
                 preview = None
-                for selector in ['.msg-conversation-card__message-snippet', '.msg-overlay-list-bubble__message-snippet']:
+                for selector in [
+                    '[data-test-id="thread-preview-text"]',  # Latest 2024 selector
+                    '.msg-conversation-card__message-snippet',
+                    '.msg-conversation-listitem__message-snippet',
+                    '.msg-overlay-list-bubble__message-snippet'
+                ]:
                     try:
                         preview = await conv.eval_on_selector(selector, "el => el.innerText")
                         if preview:
@@ -203,12 +260,26 @@ async def get_current_conversations(
                     except:
                         continue
 
-                if participant or preview:  # Only add if we found some content
+                # Get timestamp using latest selectors
+                timestamp = "Recent"
+                for selector in [
+                    '[data-test-id="thread-timestamp"]',  # Latest 2024 selector
+                    '.msg-conversation-card__timestamp',
+                    '.msg-conversation-listitem__timestamp'
+                ]:
+                    try:
+                        timestamp = await conv.eval_on_selector(selector, "el => el.innerText") or "Recent"
+                        break
+                    except:
+                        continue
+
+                if participant or preview:
                     results.append(LinkedInMessage(
                         conversation_id=conv_id or str(uuid.uuid4()),
                         participant_name=participant or "Unknown Contact",
                         message_preview=preview or "",
-                        timestamp="Recent"
+                        timestamp=timestamp,
+                        has_attachment=bool(await conv.query_selector('.msg-conversation-card__attachment-icon'))
                     ))
             except Exception as e:
                 logger.warning(f"Failed to process conversation {i}: {e}")
@@ -371,64 +442,100 @@ async def extract_mail_message_detail(ctx: BrowserContext, id: str) -> Optional[
     return detail
     
 async def ensure_thread_opened(ctx: BrowserContext, thread_id: str) -> bool:
+    """Ensure a specific conversation thread is opened"""
     page = await ctx.get_current_page()
     
-    # Check if we're already in the conversation
-    current_conversation = await page.query_selector(f'.msg-conversation-listitem[data-conversation-id="{thread_id}"]')
+    # Check if we're already in the conversation using latest selectors
+    current_conversation = await page.query_selector(f'[data-test-conversation-id="{thread_id}"]') or \
+                         await page.query_selector(f'[data-conversation-id="{thread_id}"]') or \
+                         await page.query_selector(f'[data-thread-id="{thread_id}"]')
     
     if current_conversation is not None:
-        await current_conversation.click()
-        await page.wait_for_selector('.msg-conversation-card__message-snippet-body')
+        try:
+            await current_conversation.click()
+            # Wait for message container with latest selector
+            await page.wait_for_selector('[data-test-id="message-container"]', timeout=5000)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to click conversation: {e}")
+            return False
+
+    # If not found in the current view, try to find it
+    try:
+        # Make sure we're on messaging page
+        if not page.url.startswith('https://www.linkedin.com/messaging'):
+            await page.goto('https://www.linkedin.com/messaging/', wait_until='domcontentloaded')
+            await page.wait_for_timeout(2000)
+
+        # Try to find the conversation with latest selectors
+        conversation = None
+        for selector in [
+            f'[data-test-conversation-id="{thread_id}"]',
+            f'[data-conversation-id="{thread_id}"]',
+            f'[data-thread-id="{thread_id}"]',
+            f'a[href*="/messaging/thread/{thread_id}"]'
+        ]:
+            conversation = await page.query_selector(selector)
+            if conversation:
+                break
+
+        if not conversation:
+            # Try searching for the conversation
+            search_box = await page.query_selector('[data-test-id="messaging-search-box"]') or \
+                        await page.query_selector('.msg-search-box__search-box')
+            
+            if search_box:
+                await search_box.click()
+                await search_box.type(thread_id)
+                await page.wait_for_timeout(1000)
+                
+                # Try to find the conversation again after search
+                for selector in [
+                    f'[data-test-conversation-id="{thread_id}"]',
+                    f'[data-conversation-id="{thread_id}"]',
+                    f'[data-thread-id="{thread_id}"]',
+                    f'a[href*="/messaging/thread/{thread_id}"]'
+                ]:
+                    conversation = await page.query_selector(selector)
+                    if conversation:
+                        break
+
+        if not conversation:
+            logger.error(f"Conversation with ID {thread_id} not found.")
+            return False
+
+        # Click the conversation and wait for it to load
+        await conversation.click()
+        await page.wait_for_selector('[data-test-id="message-container"]', timeout=5000)
         return True
 
-    # If not found in the current view, we might need to search or navigate
-    element: str = query_cached_element(f'linkedin-thread-element-{thread_id}')
-    
-    if not element:
+    except Exception as e:
+        logger.error(f"Failed to open thread {thread_id}: {e}")
         return False
 
-    container = await page.query_selector('.msg-conversations-container')
-    
-    if not container:
-        await page.goto('https://www.linkedin.com/messaging/', wait_until='domcontentloaded')
-        container = await page.query_selector('.msg-conversations-container')
-
-    if not container:
-        logger.error("Failed to find messages container in the page.")
-        return False
-
-    # Try to find and click the conversation
-    conversation = await page.query_selector(f'.msg-conversation-listitem[data-conversation-id="{thread_id}"]')
-    
-    if not conversation:
-        logger.error(f"Conversation with ID {thread_id} not found.")
-        return False
-
-    await conversation.click()
-    await page.wait_for_selector('.msg-conversation-card__message-snippet-body')
-    
-    return True
-
-# 2
-async def enter_conversation(
+async def read_direct_messages(
     ctx: BrowserContext,
     conversation_id: str
-) -> ResponseMessage[LinkedInConversation]:
-    """Get complete messages from a conversation using LinkedIn's GraphQL API"""
+) -> ResponseMessage[list[dict]]:
+    """Read direct messages from a specific LinkedIn conversation"""
+    response_model = ResponseMessage[list[dict]]
     page = await ctx.get_current_page()
-    response_model = ResponseMessage[LinkedInConversation]
 
     try:
-        # Make sure we're on the main messaging page
+        # Make sure we're on the messaging page
         if not page.url.startswith('https://www.linkedin.com/messaging'):
-            await page.goto('https://www.linkedin.com/messaging/', wait_until='networkidle')
+            await page.goto('https://www.linkedin.com/messaging/', wait_until='domcontentloaded')
             await page.wait_for_timeout(2000)
+
+        # Try to open the conversation
+        if not await ensure_thread_opened(ctx, conversation_id):
+            return response_model(error="Failed to open conversation", success=False)
 
         # Get messages using LinkedIn's GraphQL API
         messages = await page.evaluate("""
-            (async function getMessages(convId) {
+            async function getMessages(convId) {
                 try {
-                    // Get required tokens from cookies
+                    // Get CSRF token from cookies
                     const csrfToken = document.cookie
                         .split(';')
                         .find(c => c.trim().startsWith('JSESSIONID'))
@@ -436,231 +543,79 @@ async def enter_conversation(
 
                     if (!csrfToken) return null;
 
-                    // GraphQL query for messages
-                    const query = {
-                        query: `
-                            query GetMessages($conversationId: String!) {
-                                messagingThreadConnection(threadUrn: $conversationId) {
-                                    elements {
-                                        messages {
-                                            edges {
-                                                node {
-                                                    text
-                                                    created
-                                                    sender {
-                                                        name
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        participants {
-                                            name
-                                        }
-                                    }
-                                }
-                            }
-                        `,
-                        variables: {
-                            conversationId: `urn:li:thread:${convId}`
-                        }
-                    };
-
-                    // Make the API request
-                    const response = await fetch('https://www.linkedin.com/voyager/api/graphql', {
-                        method: 'POST',
+                    // Try REST API first
+                    const restResponse = await fetch(`https://www.linkedin.com/voyager/api/messaging/conversations/${convId}/events`, {
                         headers: {
-                            'Content-Type': 'application/json',
+                            'accept': 'application/vnd.linkedin.normalized+json+2.1',
                             'csrf-token': csrfToken,
-                            'x-li-track': '{"clientVersion":"1.12.123"}',
                             'x-restli-protocol-version': '2.0.0'
                         },
-                        credentials: 'include',
-                        body: JSON.stringify(query)
+                        credentials: 'include'
                     });
 
-                    if (!response.ok) {
-                        // If GraphQL fails, try the REST API
-                        const restResponse = await fetch(`https://www.linkedin.com/voyager/api/messaging/conversations/${convId}/events`, {
-                            headers: {
-                                'accept': 'application/vnd.linkedin.normalized+json+2.1',
-                                'csrf-token': csrfToken,
-                                'x-restli-protocol-version': '2.0.0'
-                            },
-                            credentials: 'include'
-                        });
+                    if (restResponse.ok) {
+                        const data = await restResponse.json();
+                        if (!data.elements) return null;
 
-                        if (restResponse.ok) {
-                            const data = await restResponse.json();
-                            if (!data.elements) return null;
-
-                            return data.elements
-                                .filter(msg => msg.eventContent && msg.eventContent.attributedBody)
-                                .map(msg => ({
-                                    sender: msg.from?.miniProfile?.firstName + ' ' + msg.from?.miniProfile?.lastName || 'Unknown',
-                                    text: msg.eventContent.attributedBody.text,
-                                    timestamp: msg.createdAt
-                                }));
-                        }
-                        return null;
+                        return data.elements
+                            .filter(msg => msg.eventContent && (msg.eventContent.attributedBody || msg.eventContent.text))
+                            .map(msg => ({
+                                sender: msg.from?.miniProfile?.firstName 
+                                    ? `${msg.from.miniProfile.firstName} ${msg.from.miniProfile.lastName || ''}`
+                                    : 'Unknown',
+                                text: msg.eventContent.attributedBody?.text || msg.eventContent.text || '',
+                                timestamp: msg.createdAt
+                            }));
                     }
 
-                    const data = await response.json();
-                    if (!data.data?.messagingThreadConnection?.elements?.[0]) return null;
-
-                    const thread = data.data.messagingThreadConnection.elements[0];
-                    return thread.messages.edges.map(edge => ({
-                        sender: edge.node.sender.name || 'Unknown',
-                        text: edge.node.text,
-                        timestamp: edge.node.created
-                    }));
-
+                    return null;
                 } catch (e) {
-                    console.warn('Failed to fetch messages:', e);
+                    console.error('Failed to fetch messages:', e);
                     return null;
                 }
-            })(arguments[0])
+            }
+            return await getMessages(arguments[0]);
         """, conversation_id)
 
-        # If API calls fail, try getting from Redux store
         if not messages:
-            messages = await page.evaluate("""
-            (function getMessagesFromStore(convId) {
-                try {
-                    const state = window.__INITIAL_STATE__;
-                    if (!state?.messaging?.conversations) return null;
+            # If API call fails, try scraping the UI
+            try:
+                message_elements = await page.query_selector_all('[data-test-id="message-container"] [data-test-id="message-body"]')
+                sender_elements = await page.query_selector_all('[data-test-id="message-container"] [data-test-id="message-sender-name"]')
+                timestamp_elements = await page.query_selector_all('[data-test-id="message-container"] [data-test-id="message-timestamp"]')
+                
+                scraped_messages = []
+                for i in range(len(message_elements)):
+                    try:
+                        text = await message_elements[i].inner_text()
+                        sender = await sender_elements[i].inner_text() if i < len(sender_elements) else 'Unknown'
+                        timestamp = await timestamp_elements[i].inner_text() if i < len(timestamp_elements) else 'Unknown'
+                        
+                        scraped_messages.append({
+                            'sender': sender,
+                            'text': text,
+                            'timestamp': timestamp
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to scrape message {i}: {e}")
+                        continue
+                
+                if scraped_messages:
+                    messages = scraped_messages
 
-                    const conv = state.messaging.conversations[convId];
-                    if (!conv?.events) return null;
+            except Exception as e:
+                logger.warning(f"Failed to scrape messages: {e}")
 
-                    return conv.events
-                        .filter(event => 
-                            event.eventContent && 
-                            (event.eventContent.attributedBody?.text || event.eventContent.string)
-                        )
-                        .map(event => ({
-                            sender: event.from?.miniProfile?.firstName + ' ' + event.from?.miniProfile?.lastName || 'Unknown',
-                            text: event.eventContent.attributedBody?.text || event.eventContent.string,
-                            timestamp: event.createdAt
-                        }));
-                } catch (e) {
-                    console.warn('Store extraction failed:', e);
-                    return null;
-                }
-            })(arguments[0])
-            """, conversation_id)
+        if not messages:
+            return response_model(error="Failed to fetch messages", success=False)
 
-        # Get participant info from the API response or store
-        participant = await page.evaluate("""
-            (async function getParticipantInfo(convId) {
-                try {
-                    // Try GraphQL first
-                    const csrfToken = document.cookie
-                        .split(';')
-                        .find(c => c.trim().startsWith('JSESSIONID'))
-                        ?.split('=')[1];
-
-                    if (csrfToken) {
-                        const query = {
-                            query: `
-                                query GetParticipant($conversationId: String!) {
-                                    messagingThreadConnection(threadUrn: $conversationId) {
-                                        elements {
-                                            participants {
-                                                name
-                                            }
-                                        }
-                                    }
-                                }
-                            `,
-                            variables: {
-                                conversationId: `urn:li:thread:${convId}`
-                            }
-                        };
-
-                        const response = await fetch('https://www.linkedin.com/voyager/api/graphql', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'csrf-token': csrfToken,
-                                'x-restli-protocol-version': '2.0.0'
-                            },
-                            credentials: 'include',
-                            body: JSON.stringify(query)
-                        });
-
-                        if (response.ok) {
-                            const data = await response.json();
-                            const participants = data.data?.messagingThreadConnection?.elements?.[0]?.participants;
-                            if (participants?.length > 0) {
-                                return participants[0].name;
-                            }
-                        }
-                    }
-
-                    // Fallback to store
-                    const state = window.__INITIAL_STATE__;
-                    if (state?.messaging?.profiles) {
-                        const profiles = Object.values(state.messaging.profiles);
-                        const profile = profiles.find(p => p?.entityUrn?.includes(convId));
-                        if (profile?.miniProfile) {
-                            return profile.miniProfile.firstName + ' ' + profile.miniProfile.lastName;
-                        }
-                    }
-
-                    return null;
-                } catch (e) {
-                    console.warn('Failed to get participant info:', e);
-                    return null;
-                }
-            })(arguments[0])
-        """, conversation_id)
-
-        conversation = LinkedInConversation(
-            conversation_id=conversation_id,
-            messages=messages or [],
-            participant_name=participant or "Unknown Contact"
-        )
-
-        return response_model(result=conversation)
+        return response_model(result=messages)
 
     except Exception as e:
-        error_msg = f"Failed to read conversation: {str(e)}"
+        error_msg = f"Failed to read messages: {str(e)}"
         logger.error(error_msg)
         return response_model(error=error_msg, success=False)
 
-async def compose_regions(ctx: BrowserContext) -> list[ElementHandle]:
-    page = await ctx.get_current_page()
-    regions = await page.query_selector_all('div[role="region"][data-compose-id]') 
-    return regions
-
-async def send_key_combo(element: ElementHandle, keys: list[str]) -> bool:
-    """
-    Send a key combination to the specified element.
-    """
-    
-    if not element:
-        logger.error("Element is None, cannot send key combination.")
-        return False
-
-    await element.focus()
-    
-    for key in keys:
-        await element.keyboard.down(key)
-
-    await asyncio.sleep(0.1)  # Small delay to ensure the keys are registered
-
-    for key in reversed(keys):
-        await element.keyboard.up(key)
-
-async def discard_drafts(ctx: BrowserContext) -> bool:
-    await ensure_authorized(ctx)
-    regions = await compose_regions(ctx)
-
-    for region in regions:
-        logger.info(f"Discarding draft in region: {region}")
-        await send_key_combo(region, ['Control', 'Shift', 'd'])  # Ctrl + Shift + D to discard draft
-
-# 6
 async def sign_out(ctx: BrowserContext) -> ResponseMessage[bool]:
     response_model = ResponseMessage[bool]
 
@@ -718,63 +673,17 @@ async def get_context_aware_available_toolcalls(ctx: BrowserContext):
         {
             "type": "function",
             "function": {
-                "name": "enter_conversation",
-                "description": "Open a specific LinkedIn conversation by its ID and get the full message history.",
+                "name": "extract_linkedin_info",
+                "description": "Extract LinkedIn information in a format that's easy for AI agents to read.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "conversation_id": {
-                            "type": "string",
-                            "description": "The ID of the conversation to open."
+                        "include_words": {
+                            "type": ["string", "null"],
+                            "description": "Optional words to filter conversations by."
                         }
                     },
-                    "required": ["conversation_id"],
-                    "additionalProperties": False
-                },
-                "strict": False
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_message",
-                "description": "Send a new message in a LinkedIn conversation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "conversation_id": {
-                            "type": "string",
-                            "description": "The ID of the conversation to send the message in."
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "The message text to send."
-                        }
-                    },
-                    "required": ["conversation_id", "message"],
-                    "additionalProperties": False
-                },
-                "strict": False
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "start_new_conversation",
-                "description": "Start a new LinkedIn conversation with a connection.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "recipient": {
-                            "type": "string",
-                            "description": "The name or profile URL of the LinkedIn connection to message."
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "The initial message to send."
-                        }
-                    },
-                    "required": ["recipient", "message"],
+                    "required": [],
                     "additionalProperties": False
                 },
                 "strict": False
@@ -820,25 +729,11 @@ async def execute_toolcall(
         return await check_login_status(ctx)
     elif tool_name == "list_conversations":
         return await get_current_conversations(ctx, **args)
-    elif tool_name == "enter_conversation":
-        conversation_id = args.pop('conversation_id', None)
-        if not conversation_id:
-            return response_model(error="Conversation ID is required", success=False)
-        return await enter_conversation(ctx, conversation_id)
-    elif tool_name == "send_message":
-        conversation_id = args.pop('conversation_id', None)
-        message = args.pop('message', None)
-        if not conversation_id or not message:
-            return response_model(error="Both conversation_id and message are required", success=False)
-        return await reply_to_thread(ctx, thread_id=conversation_id, message=message)
-    elif tool_name == "start_new_conversation":
-        recipient = args.pop('recipient', None)
-        message = args.pop('message', None)
-        if not recipient or not message:
-            return response_model(error="Both recipient and message are required", success=False)
-        return await compose_email(ctx, recipient=recipient, subject="", body=message)
     elif tool_name == "sign_out":
         return await sign_out(ctx)
+    elif tool_name == "extract_linkedin_info":
+        include_words = args.get('include_words', None)
+        return await extract_linkedin_info(ctx, include_words)
     else:
         return response_model(error=f"Unknown tool call: {tool_name}", success=False)
 
@@ -864,5 +759,169 @@ async def get_current_user_identity(
 
     user_identity = await element.get_attribute('alt')
     return response_model(result=user_identity)
+
+async def read_linkedin_conversations(ctx: BrowserContext) -> ResponseMessage[list[LinkedInConversation]]:
+    """Read LinkedIn conversations using GraphQL API"""
+    page = await ctx.get_current_page()
+    response_model = ResponseMessage[list[LinkedInConversation]]
+
+    try:
+        # Ensure we're on messaging page
+        if not page.url.startswith('https://www.linkedin.com/messaging'):
+            await page.goto('https://www.linkedin.com/messaging/', wait_until='networkidle')
+            await page.wait_for_timeout(2000)
+
+        # Get conversations using LinkedIn's GraphQL API
+        conversations = await page.evaluate("""
+            async function getConversations() {
+                try {
+                    // Get CSRF token from cookies
+                    const csrfToken = document.cookie
+                        .split(';')
+                        .find(c => c.trim().startsWith('JSESSIONID'))
+                        ?.split('=')[1];
+
+                    if (!csrfToken) return null;
+
+                    // GraphQL query for conversations
+                    const query = {
+                        query: `
+                            query GetConversations {
+                                messagingThreads {
+                                    elements {
+                                        conversationId
+                                        participants {
+                                            name
+                                        }
+                                        messages {
+                                            edges {
+                                                node {
+                                                    text
+                                                    created
+                                                    sender {
+                                                        name
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        `
+                    };
+
+                    // Make API request
+                    const response = await fetch('https://www.linkedin.com/voyager/api/graphql', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'csrf-token': csrfToken,
+                            'x-restli-protocol-version': '2.0.0'
+                        },
+                        credentials: 'include',
+                        body: JSON.stringify(query)
+                    });
+
+                    if (!response.ok) {
+                        // Try REST API as fallback
+                        const restResponse = await fetch('https://www.linkedin.com/voyager/api/messaging/conversations', {
+                            headers: {
+                                'accept': 'application/vnd.linkedin.normalized+json+2.1',
+                                'csrf-token': csrfToken,
+                                'x-restli-protocol-version': '2.0.0'
+                            },
+                            credentials: 'include'
+                        });
+
+                        if (restResponse.ok) {
+                            const data = await restResponse.json();
+                            return data.elements.map(conv => ({
+                                conversationId: conv.entityUrn,
+                                participantName: conv.participants?.[0]?.name || 'Unknown',
+                                messages: conv.events
+                                    .filter(msg => msg.eventContent && msg.eventContent.attributedBody)
+                                    .map(msg => ({
+                                        sender: msg.from?.miniProfile?.firstName + ' ' + msg.from?.miniProfile?.lastName || 'Unknown',
+                                        text: msg.eventContent.attributedBody.text,
+                                        timestamp: msg.createdAt
+                                    }))
+                            }));
+                        }
+                        return null;
+                    }
+
+                    const data = await response.json();
+                    return data.data?.messagingThreads?.elements?.map(thread => ({
+                        conversationId: thread.conversationId,
+                        participantName: thread.participants[0]?.name || 'Unknown',
+                        messages: thread.messages.edges.map(edge => ({
+                            sender: edge.node.sender.name || 'Unknown',
+                            text: edge.node.text,
+                            timestamp: edge.node.created
+                        }))
+                    })) || [];
+
+                } catch (e) {
+                    console.error('Failed to fetch conversations:', e);
+                    return null;
+                }
+            }
+            return await getConversations();
+        """)
+
+        if not conversations:
+            return response_model(error="Failed to fetch conversations", success=False)
+
+        return response_model(result=[
+            LinkedInConversation(
+                conversation_id=conv['conversationId'],
+                participant_name=conv['participantName'],
+                messages=conv['messages']
+            ) for conv in conversations
+        ])
+
+    except Exception as e:
+        error_msg = f"Failed to read conversations: {str(e)}"
+        logger.error(error_msg)
+        return response_model(error=error_msg, success=False)
+
+async def extract_linkedin_info(
+    ctx: BrowserContext,
+    include_words: Optional[str] = None
+) -> ResponseMessage[dict]:
+    """Extract LinkedIn information in a format that's easy for AI agents to read"""
+    response_model = ResponseMessage[dict]
+    
+    try:
+        # First check login status
+        login_status = await check_login_status(ctx)
+        if not login_status.success or not login_status.result.get('is_logged_in'):
+            return response_model(error="Not logged in to LinkedIn", success=False)
+
+        # Get conversations
+        conversations = await get_current_conversations(ctx, include_words=include_words)
+        if not conversations.success:
+            return response_model(error="Failed to get conversations", success=False)
+
+        # Format the data in an AI-friendly way
+        formatted_data = {
+            "profile": login_status.result,
+            "conversations": [
+                {
+                    "id": conv.conversation_id,
+                    "participant": conv.participant_name,
+                    "last_message": conv.message_preview,
+                    "timestamp": conv.timestamp
+                }
+                for conv in conversations.result
+            ]
+        }
+
+        return response_model(result=formatted_data)
+
+    except Exception as e:
+        error_msg = f"Failed to extract LinkedIn info: {str(e)}"
+        logger.error(error_msg)
+        return response_model(error=error_msg, success=False)
         
         
