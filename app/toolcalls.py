@@ -68,6 +68,15 @@ async def get_context_aware_available_toolcalls(ctx: BrowserContext):
                 'parameters': {},
                 'strict': False
             }
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'read_full_conversation',
+                'description': 'Reads all messages in the currently open LinkedIn conversation thread.',
+                'parameters': {},
+                'strict': False
+            }
         }
     ]
 
@@ -78,7 +87,8 @@ async def get_context_aware_available_toolcalls(ctx: BrowserContext):
         return [tool for tool in toolcalls if tool['function']['name'] != 'sign_out']
     else:
         # Return only sign_out and check_login_status when not authorized
-        return [tool for tool in toolcalls if tool['function']['name'] in ['sign_out', 'check_login_status']]
+        allowed_unauthorized = ['sign_out', 'check_login_status', 'read_full_conversation']
+        return [tool for tool in toolcalls if tool['function']['name'] in allowed_unauthorized]
 
 async def execute_toolcall(
     ctx: BrowserContext, 
@@ -91,6 +101,8 @@ async def execute_toolcall(
         return await check_login_status(ctx)
     elif tool_name == "sign_out":
         return await sign_out(ctx)
+    elif tool_name == "read_full_conversation":
+        return await read_full_conversation(ctx)
     else:
         return response_model(error=f"Unknown tool call: {tool_name}", success=False)
 
@@ -117,4 +129,42 @@ async def get_current_user_identity(
 
     user_identity = await element.get_attribute('alt')
     return response_model(result=user_identity)
+
+async def read_full_conversation(ctx: BrowserContext) -> ResponseMessage[list[str]]:
+    """
+    Reads all messages in the currently open LinkedIn conversation thread.
+    """
+    response_model = ResponseMessage[list[str]]
+    
+    if not await check_authorization(ctx):
+        return response_model(error="User is not authorized.", success=False)
+    
+    try:
+        page = await ctx.get_current_page()
+        
+        # 1) Wait until at least one bubble appears
+        await page.wait_for_selector(
+            "div.msg-s-event-listitem__message-bubble p",
+            timeout=15_000
+        )
+
+        # 2) Grab all <p> under those bubble divs
+        elems = await page.query_selector_all(
+            "div.msg-s-event-listitem__message-bubble p"
+        )
+
+        # 3) Extract their text
+        messages = []
+        for el in elems:
+            txt = (await el.inner_text()).strip()
+            if txt:
+                messages.append(txt)
+
+        return response_model(result=messages)
+            
+    except PlaywrightTimeoutError:
+        return response_model(error="Timeout waiting for messages to load", success=False)
+    except Exception as e:
+        logger.error(f"Error reading conversation: {str(e)}")
+        return response_model(error=f"Failed to read conversation: {str(e)}", success=False)
 
