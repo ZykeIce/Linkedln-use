@@ -1,87 +1,259 @@
-from browser_use import Controller, Browser, ActionResult, BrowserConfig, BrowserContext
-import fnmatch
+from browser_use.browser.context import BrowserContext
+from playwright.async_api._generated import ElementHandle, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from typing import Optional, Generic, TypeVar, Any
+from .controllers import (
+    check_authorization,
+    ensure_url,
+    get_login_status
+)
+from .signals import UnauthorizedAccess
+from pydantic import BaseModel, model_validator
+import logging
 import json
 import asyncio
 from datetime import datetime
 
-# Add test log to verify logging is working
-print("=== LinkedIn Script Started ===")
+logger = logging.getLogger(__name__)
 
-browser = Browser(
-    config=BrowserConfig(
-        chrome_instance_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    )
-)
+_generic_type = TypeVar('_generic_type')
+class ResponseMessage(BaseModel, Generic[_generic_type]):
+    result: Optional[_generic_type] = None
+    error: Optional[str] = None
+    success: bool = True
 
-async def navigate_to_linkedln(ctx : BrowserContext) -> None:
+    @model_validator(mode="after")
+    def refine_status(self):
+        if self.error is not None:
+            self.success = False
+        return self
+
+async def ensure_authorized(ctx: BrowserContext) -> bool:
+    if not await check_authorization(ctx):
+        await ensure_url(ctx, 'https://www.linkedin.com/')
+        raise UnauthorizedAccess('You are not authorized to access this resource. Please log in to your LinkedIn account.')
+    await ensure_url(ctx, 'https://www.linkedin.com/')
+    return True
+
+async def sign_out(ctx: BrowserContext) -> ResponseMessage[bool]:
+    response_model = ResponseMessage[bool]
+    if not await check_authorization(ctx):
+        return response_model(result=True)
     page = await ctx.get_current_page()
-    str_destination = "https://www.linkedin.com/"
-    await page.goto(str_destination, wait_until="domcontentloaded")
+    await page.goto('https://www.linkedin.com/m/logout')
+    return response_model(result=True)
 
-async def ensure_linkedln(ctx : BrowserContext) -> None:
-    page = await ctx.get_current_page()
-    str_destination = "https://www.linkedin.com/"
-    current_url = page.url
-    if not fnmatch.fnmatch(current_url, str_destination + "*"):
-        await navigate_to_linkedln(ctx)
+async def check_login_status(ctx: BrowserContext) -> ResponseMessage[dict]:
+    """Check the current LinkedIn login status and return profile information if available."""
+    response_model = ResponseMessage[dict]
+    try:
+        status = await get_login_status(ctx)
+        return response_model(result=status)
+    except Exception as e:
+        return response_model(error=str(e), success=False)
 
-
-async def auto_sign_in(ctx: BrowserContext):
-    accountemail = "huy.20080119.606@gmail.com"
-    accountpassword = "Bruh98012"
-    page = await ctx.get_current_page()
-    await page.wait_for_load_state("domcontentloaded")
-    google_btn = page.locator('div.nsm7Bb-HzV7m-LgbsSe[role="button"]', has_text="Continue with Google")
-    await google_btn.wait_for()
-    await google_btn.click()
-    popup_page = await page.wait_for_event('popup')
-    await popup_page.wait_for_load_state("domcontentloaded")
-    await popup_page.locator('input[type="email"]').fill(accountemail)
-    await popup_page.locator('text=Next').click()
-    await popup_page.locator('input[type="password"]').fill(accountpassword)
-    await popup_page.locator('text=Next').click()
-
-async def navigate_to_messaging(ctx: BrowserContext):
-    page = await ctx.get_current_page()
-    messaging_button = page.locator('a.global-nav__primary-link[href*="/messaging/"]')
-    await messaging_button.wait_for()
-    await messaging_button.click()
-
-async def fetch_profile_in_message(ctx: BrowserContext):
-    """
-    Fetches profiles from LinkedIn messaging using confirmed working selectors.
-    Returns and saves a JSON structure containing profile information and interaction data.
-    """
-    print("\n=== Fetching Profiles from Messages ===")
-    page = await ctx.get_current_page()
-    
-    # Initialize the result structure
-    result = {
-        "profiles": [],
-        "metadata": {
-            "total_count": 0,
-            "fetch_time": datetime.now().isoformat(),
-            "container_selector": "div.msg-overlay-list-bubble"
+async def get_context_aware_available_toolcalls(ctx: BrowserContext):
+    toolcalls = [
+        {
+            'type': 'function',
+            'function': {
+                'name': 'sign_out',
+                'description': 'Sign out from the current LinkedIn session.',
+                'parameters': {},
+                'strict': False
+            }
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'check_login_status',
+                'description': 'Check if the user is logged into LinkedIn and get profile information.',
+                'parameters': {},
+                'strict': False
+            }
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'read_full_conversation',
+                'description': 'Reads all messages in the currently open LinkedIn conversation thread.',
+                'parameters': {},
+                'strict': False
+            }
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'fetch_profile_in_message',
+                'description': 'Fetches all profiles from LinkedIn messaging, including conversation metadata and thread links.',
+                'parameters': {},
+                'strict': False
+            }
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'enter_conversation_directly',
+                'description': 'Enters a specific conversation. IMPORTANT: First use fetch_profile_in_message to get the list of conversations, then call this with the exact name.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'target_name': {
+                            'type': 'string',
+                            'description': 'Exact name of the contact to chat with (must match the name from fetch_profile_in_message)'
+                        }
+                    },
+                    'required': ['target_name'],
+                    'additionalProperties': False
+                },
+                'strict': True
+            }
         }
-    }
+    ]
+
+    is_authorized = await check_authorization(ctx)
+
+    if is_authorized:
+        # Return all tools except sign_out when authorized
+        return [tool for tool in toolcalls if tool['function']['name'] != 'sign_out']
+    else:
+        # Return only sign_out and check_login_status when not authorized
+        allowed_unauthorized = ['sign_out', 'check_login_status', 'read_full_conversation']
+        return [tool for tool in toolcalls if tool['function']['name'] in allowed_unauthorized]
+
+async def execute_toolcall(
+    ctx: BrowserContext, 
+    tool_name: str, 
+    args: dict[str, Any]
+) -> ResponseMessage[Any]:
+    response_model = ResponseMessage[Any]
+
+    if tool_name == "check_login_status":
+        return await check_login_status(ctx)
+    elif tool_name == "sign_out":
+        return await sign_out(ctx)
+    elif tool_name == "read_full_conversation":
+        return await read_full_conversation(ctx)
+    elif tool_name == "fetch_profile_in_message":
+        return await fetch_profile_in_message(ctx)
+    elif tool_name == "enter_conversation_directly":
+        return await enter_conversation_directly(ctx, args.get("target_name"))
+    else:
+        return response_model(error=f"Unknown tool call: {tool_name}", success=False)
+
+async def get_current_user_identity(
+    ctx: BrowserContext
+) -> ResponseMessage[str]:
+    """Get the current user's identity from their LinkedIn profile."""
+    response_model = ResponseMessage[str]
+
+    if not await check_authorization(ctx):
+        return response_model(error="User is not authorized.", success=False)
+
+    page = await ctx.get_current_page()
+    url = page.url.strip("/")
+
+    if not url.startswith('https://www.linkedin.com'):
+        return response_model(error="User is not on LinkedIn page.", success=False)
+
+    # Update selector for LinkedIn profile
+    element = await page.query_selector('.global-nav__me-photo')
+
+    if not element:
+        return response_model(error="Failed to find the user identity element.", success=False)
+
+    user_identity = await element.get_attribute('alt')
+    return response_model(result=user_identity)
+
+async def read_full_conversation(ctx: BrowserContext) -> ResponseMessage[list[str]]:
+    """
+    Reads all messages in the currently open LinkedIn conversation thread.
+    """
+    response_model = ResponseMessage[list[str]]
+    
+    if not await check_authorization(ctx):
+        return response_model(error="User is not authorized.", success=False)
     
     try:
-        # Wait for the messaging overlay - confirmed working from analysis
+        page = await ctx.get_current_page()
+        
+        # 1) Wait until at least one bubble appears
+        await page.wait_for_selector(
+            "div.msg-s-event-listitem__message-bubble p",
+            timeout=15_000
+        )
+
+        # 2) Grab all <p> under those bubble divs
+        elems = await page.query_selector_all(
+            "div.msg-s-event-listitem__message-bubble p"
+        )
+
+        # 3) Extract their text
+        messages = []
+        for el in elems:
+            txt = (await el.inner_text()).strip()
+            if txt:
+                messages.append(txt)
+
+        return response_model(result=messages)
+            
+    except PlaywrightTimeoutError:
+        return response_model(error="Timeout waiting for messages to load", success=False)
+    except Exception as e:
+        logger.error(f"Error reading conversation: {str(e)}")
+        return response_model(error=f"Failed to read conversation: {str(e)}", success=False)
+
+async def fetch_profile_in_message(ctx: BrowserContext) -> ResponseMessage[dict]:
+    """
+    Fetches basic message preview information from LinkedIn messaging.
+    Only retrieves:
+    - Name of the contact
+    - Last message timestamp
+    - Message preview text (if available)
+    
+    This function does NOT:
+    - Click on any profiles
+    - Navigate to conversation threads
+    - Collect additional profile information
+    - Save any files locally
+    
+    Returns a simple list of message previews with minimal information.
+    Use this function first to get a list of conversations, then use enter_conversation_directly
+    with the chosen conversation data.
+    """
+    response_model = ResponseMessage[dict]
+    
+    if not await check_authorization(ctx):
+        return response_model(error="User is not authorized.", success=False)
+    
+    try:
+        page = await ctx.get_current_page()
+        
+        # Initialize the result structure
+        result = {
+            "messages": [],
+            "metadata": {
+                "total_count": 0,
+                "fetch_time": datetime.now().isoformat()
+            }
+        }
+        
+        # Wait for the messaging overlay
         messaging_container = page.locator('div.msg-overlay-list-bubble')
         await messaging_container.wait_for(state="visible", timeout=10000)
         
-        # Wait for the conversation list - confirmed working from analysis
+        # Wait for the conversation list
         conversation_list = page.locator('.msg-conversations-container__conversations-list')
         await conversation_list.wait_for(state="visible", timeout=10000)
         
-        # Get all conversation threads using the most reliable selector
+        # Get all conversation threads
         thread_elements = page.locator('.msg-conversation-card')
         thread_count = await thread_elements.count()
-        print(f"Found {thread_count} conversations")
         
         result["metadata"]["total_count"] = thread_count
+        logger.info(f"Found {thread_count} conversations")
         
-        # First gather all basic information without clicking
+        # Gather basic message preview information
         for i in range(thread_count):
             try:
                 thread = thread_elements.nth(i)
@@ -91,11 +263,7 @@ async def fetch_profile_in_message(ctx: BrowserContext):
                 name = await name_element.text_content()
                 name = name.strip()
                 
-                # Check for unread messages
-                unread_indicator = thread.locator('.msg-conversation-card__unread-count')
-                has_unread = await unread_indicator.count() > 0
-                
-                # Try to get last message time
+                # Get last message time
                 try:
                     time_element = thread.locator('.msg-conversation-card__time-stamp')
                     last_message_time = await time_element.text_content()
@@ -103,570 +271,141 @@ async def fetch_profile_in_message(ctx: BrowserContext):
                 except:
                     last_message_time = None
                 
-                # Store initial profile info
-                profile_data = {
-                    "id": i + 1,
-                    "name": name,
-                    "thread_link": None,  # Will be updated later
-                    "last_message_time": last_message_time,
-                    "unread": has_unread,
-                    "element_selectors": {
-                        "thread": ".msg-conversation-card",
-                        "name": ".msg-conversation-card__participant-names",
-                        "index": i
-                    }
-                }
-                
-                result["profiles"].append(profile_data)
-                print(f"✓ Gathered basic info for {i+1}/{thread_count}: {name}")
-                
-            except Exception as e:
-                print(f"Error gathering info for conversation {i+1}: {str(e)}")
-                continue
-        
-        # Now get thread links with optimized timing
-        for i, profile in enumerate(result["profiles"]):
-            try:
-                thread = thread_elements.nth(profile["element_selectors"]["index"])
-                
-                # Click the thread with a shorter timeout
-                await thread.click()
-                
-                # Wait for URL to change with a shorter timeout
+                # Try to get message preview text
                 try:
-                    await page.wait_for_url("**/messaging/thread/**", timeout=5000)
-                    profile["thread_link"] = page.url
-                    print(f"✓ Got thread link for: {profile['name']}")
-                except Exception as e:
-                    print(f"Timeout getting thread link for {profile['name']}, using fallback method")
-                    profile["thread_link"] = page.url
+                    preview_element = thread.locator('.msg-conversation-card__message-snippet')
+                    preview_text = await preview_element.text_content()
+                    preview_text = preview_text.strip()
+                except:
+                    preview_text = None
                 
-                # Quick check if we need to go back
-                if i < len(result["profiles"]) - 1:
-                    await conversation_list.click()
-                    await asyncio.sleep(1)  # Short pause between operations
-                
-            except Exception as e:
-                print(f"Error getting thread link for {profile['name']}: {str(e)}")
-                continue
-        
-        print(f"\nSuccessfully processed {len(result['profiles'])} profiles")
-        
-        # Save the result to a JSON file
-        with open('linkedin_messages.json', 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        print("Profile data saved to linkedin_messages.json")
-        
-        return result
-        
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {
-            "profiles": [],
-            "metadata": {
-                "total_count": 0,
-                "fetch_time": datetime.now().isoformat(),
-                "error": str(e)
-            }
-        }
-
-async def is_logged_in(ctx : BrowserContext):
-    await ensure_linkedln(ctx)
-    page = await ctx.get_current_page()
-    await page.wait_for_load_state("domcontentloaded")
-    try:
-        if await page.locator('a[data-tracking-control-name="guest_homepage-basic_nav-header-signin"]').is_visible():
-            print("Not logged in")
-            return False 
-        print("Logged in")
-        return True
-    except Exception as e:
-        print(e)
-        return False
-
-
-async def select_conversation(matches: list) -> dict:
-    """
-    Prompts user to select a conversation when multiple matches are found.
-    
-    Args:
-        matches (list): List of matching conversations
-        
-    Returns:
-        dict: Selected conversation or None if invalid input
-    """
-    print("\n[Select] Multiple matching conversations found:")
-    for i, conv in enumerate(matches):
-        unread = "🔵" if conv["unread"] else "  "
-        time = conv["last_message_time"] or "no time"
-        print(f"{i + 1}. {unread} {conv['name']} ({time})")
-        if conv["metadata"]["is_group"]:
-            print(f"   Group chat with {conv['metadata']['participant_count']} participants")
-    
-    try:
-        choice = input("\n[Select] Enter number to choose conversation (or press Enter to cancel): ")
-        if not choice:
-            return None
-            
-        idx = int(choice) - 1
-        if 0 <= idx < len(matches):
-            return matches[idx]
-        else:
-            print("[Error] Invalid selection")
-            return None
-    except ValueError:
-        print("[Error] Please enter a valid number")
-        return None
-
-async def filter_threads_by_name(name_query: str) -> list:
-    """
-    Filter threads by name from the saved JSON data.
-    Returns a list of matching conversations.
-    
-    Args:
-        name_query (str): Name or partial name to search for (case-insensitive)
-    
-    Returns:
-        list: List of matching conversation dictionaries
-    """
-    try:
-        # Load the saved JSON data
-        with open('conversation_list.json', 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Filter conversations where name contains the query (case-insensitive)
-        matches = [
-            conv for conv in data["conversations"] 
-            if name_query.lower() in conv["name"].lower()
-        ]
-        
-        # Print results
-        if matches:
-            print(f"\n[Search] Found {len(matches)} matching conversations:")
-            for conv in matches:
-                unread = "🔵" if conv["unread"] else "  "
-                time = conv["last_message_time"] or "no time"
-                print(f"{unread} [{conv['index']}] {conv['name']} ({time})")
-                if conv["metadata"]["is_group"]:
-                    print(f"    Group chat with {conv['metadata']['participant_count']} participants")
-                    
-            # If multiple matches, let user select one
-            if len(matches) > 1:
-                selected = await select_conversation(matches)
-                if selected:
-                    return [selected]  # Return single-item list for compatibility
-                else:
-                    print("[Info] Conversation selection cancelled")
-                    return []
-        else:
-            print(f"[Search] No conversations found matching '{name_query}'")
-            
-        return matches
-        
-    except FileNotFoundError:
-        print("[Error] No saved conversation data found. Please fetch conversations first.")
-        return []
-    except json.JSONDecodeError as e:
-        print(f"[Error] Invalid JSON in conversation data: {str(e)}")
-        return []
-    except Exception as e:
-        print(f"[Error] Error filtering conversations: {str(e)}")
-        return []
-
-async def enter_conversation_by_id(ctx: BrowserContext, thread_id: int):
-    """
-    Enter a specific conversation by its ID.
-    Throws an error if no thread or multiple threads match the ID.
-    
-    Args:
-        ctx (BrowserContext): Browser context
-        thread_id (int): ID of the thread to enter (matches the index)
-        
-    Raises:
-        ValueError: If no thread or multiple threads match the ID
-    """
-    try:
-        # Load the saved JSON data
-        with open('conversation_list.json', 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Find the exact thread using index
-        matches = [c for c in data["conversations"] if c["index"] == thread_id]
-        
-        if len(matches) == 0:
-            raise ValueError(f"[Error] No conversation found with ID {thread_id}")
-        elif len(matches) > 1:
-            raise ValueError(f"[Error] Multiple conversations found with ID {thread_id}")
-        
-        # Use enter_conversation_directly since it has better error handling
-        return await enter_conversation_directly(ctx, matches)
-        
-    except FileNotFoundError:
-        raise ValueError("[Error] No saved conversation data found. Please fetch conversations first.")
-    except Exception as e:
-        raise ValueError(f"[Error] Failed to enter conversation: {str(e)}")
-
-async def enter_conversation_directly(ctx: BrowserContext, conversation_data: list) -> bool:
-    """
-    Enters a conversation using the provided conversation data.
-    Expects exactly one conversation in the list.
-    
-    Args:
-        ctx (BrowserContext): Browser context
-        conversation_data (list): List containing exactly one conversation dictionary
-        
-    Returns:
-        bool: True if successfully entered conversation, False otherwise
-        
-    Raises:
-        ValueError: If conversation_data is empty or contains multiple conversations
-    """
-    print("[Enter] Validating conversation data...")
-    
-    # Validate input
-    if not conversation_data:
-        raise ValueError("[Error] No conversation data provided")
-    if len(conversation_data) > 1:
-        raise ValueError(f"[Error] Expected 1 conversation, got {len(conversation_data)}")
-    
-    conversation = conversation_data[0]
-    page = await ctx.get_current_page()
-    
-    try:
-        # Ensure we're on messaging page
-        messaging_container = page.locator('div.msg-overlay-list-bubble')
-        if not await messaging_container.is_visible():
-            print("[Enter] Opening messaging page...")
-            await navigate_to_messaging(ctx)
-            await messaging_container.wait_for(state="visible", timeout=10000)
-        
-        print(f"[Enter] Attempting to enter conversation with: {conversation['name']}")
-        
-        # Use the stored selector to find the conversation
-        conversation_cards = page.locator(conversation['selectors']['card'])
-        count = await conversation_cards.count()
-        
-        if count == 0:
-            print("[Enter] No conversations visible, checking alternative selectors...")
-            alternative_selectors = [
-                'li.msg-conversation-listitem',
-                '.msg-conversation-listitem__link',
-                '.msg-selectable-entity'
-            ]
-            
-            for selector in alternative_selectors:
-                conversation_cards = page.locator(selector)
-                count = await conversation_cards.count()
-                if count > 0:
-                    print(f"[Enter] Found conversations using: {selector}")
-                    break
-        
-        if conversation['index'] >= count:
-            raise ValueError(f"[Error] Conversation index {conversation['index']} out of range (total: {count})")
-            
-        # Get the specific conversation card
-        card = conversation_cards.nth(conversation['index'])
-        
-        # Verify we're clicking the right conversation
-        name_element = card.locator(conversation['selectors']['name'])
-        if await name_element.count() > 0:
-            actual_name = await name_element.text_content()
-            actual_name = actual_name.strip()
-            if actual_name != conversation['name']:
-                print(f"[Warning] Name mismatch: Expected '{conversation['name']}', found '{actual_name}'")
-        
-        # Click the conversation
-        print("[Enter] Clicking conversation...")
-        await card.click()
-        await page.wait_for_url("**/messaging/thread/**", timeout=5000)
-        
-        print(f"[Success] Entered conversation with {conversation['name']}")
-        if conversation['metadata']['is_group']:
-            print(f"[Info] This is a group chat with {conversation['metadata']['participant_count']} participants")
-        if conversation['unread']:
-            print("[Info] Conversation has unread messages")
-            
-        return True
-        
-    except Exception as e:
-        print(f"[Error] Failed to enter conversation: {str(e)}")
-        return False
-
-async def fetch_conversation_list(ctx: BrowserContext, limit: int = 30) -> dict:
-    """
-    Quickly fetches a list of available conversations and their metadata.
-    Returns a structured JSON format that's easily expandable.
-    
-    Args:
-        ctx (BrowserContext): Browser context
-        limit (int, optional): Maximum number of conversations to fetch. Defaults to 30.
-        
-    Returns:
-        dict: Structured conversation data
-    """
-    page = await ctx.get_current_page()
-    print(f"[Fetch] Getting conversation list (limit: {limit})...")
-    
-    result = {
-        "conversations": [],
-        "summary": {
-            "total_count": 0,
-            "unread_count": 0,
-            "fetch_time": datetime.now().isoformat(),
-            "version": "1.0",
-            "limit_applied": limit
-        }
-    }
-    
-    try:
-        # Wait for the messaging container to be visible
-        print("[Fetch] Waiting for messaging container...")
-        messaging_container = page.locator('div.msg-overlay-list-bubble')
-        await messaging_container.wait_for(state="visible", timeout=10000)
-        
-        # Wait for the conversation list to be visible
-        print("[Fetch] Waiting for conversation list...")
-        conversation_list = page.locator('.msg-conversations-container__conversations-list')
-        await conversation_list.wait_for(state="visible", timeout=10000)
-        
-        # Give a short time for dynamic content to load
-        await asyncio.sleep(2)
-        
-        # Find all conversation cards
-        conversation_cards = page.locator('.msg-conversation-card')
-        total_count = await conversation_cards.count()
-        
-        if total_count == 0:
-            # Try alternative selectors if the first one returns no results
-            print("[Fetch] No conversations found with primary selector, trying alternatives...")
-            alternative_selectors = [
-                'li.msg-conversation-listitem',
-                '.msg-conversation-listitem__link',
-                '.msg-selectable-entity'
-            ]
-            
-            for selector in alternative_selectors:
-                conversation_cards = page.locator(selector)
-                total_count = await conversation_cards.count()
-                if total_count > 0:
-                    print(f"[Fetch] Found {total_count} conversations using alternative selector: {selector}")
-                    break
-        
-        if total_count == 0:
-            print("[Fetch] Still no conversations found. Taking debug screenshot...")
-            await page.screenshot(path="debug_messaging_page.png")
-            print("[Fetch] Debug screenshot saved as debug_messaging_page.png")
-            return result
-            
-        # Apply limit
-        count_to_process = min(total_count, limit)
-        print(f"[Fetch] Processing {count_to_process} out of {total_count} conversations...")
-        unread_count = 0
-        
-        def truncate_text(text, max_length=40):
-            """Helper to truncate and clean text"""
-            if not text:
-                return None
-            # Clean up whitespace and remove newlines
-            text = " ".join(text.split())
-            if len(text) <= max_length:
-                return text
-            return text[:max_length-3] + "..."
-        
-        # Process each conversation up to the limit
-        for i in range(count_to_process):
-            try:
-                card = conversation_cards.nth(i)
-                
-                # Get name (try multiple selectors)
-                name = ""
-                name_selectors = [
-                    '.msg-conversation-card__participant-names',
-                    '.msg-conversation-listitem__participant-names',
-                    '.msg-selectable-entity__content'
-                ]
-                
-                for selector in name_selectors:
-                    name_element = card.locator(selector)
-                    if await name_element.count() > 0:
-                        name = await name_element.text_content()
-                        name = truncate_text(name, 25)  # Truncate name
-                        if name:
-                            break
-                
-                if not name:
-                    print(f"[Warning] Could not find name for conversation {i}")
-                    continue
-                
-                # Check unread status
-                unread_indicator = card.locator('.msg-conversation-card__unread-count')
-                has_unread = await unread_indicator.count() > 0
-                if has_unread:
-                    unread_count += 1
-                
-                # Get last message time
-                time_element = card.locator('.msg-conversation-card__time-stamp')
-                last_message_time = await time_element.text_content() if await time_element.count() > 0 else None
-                
-                # Get recent message preview
-                message_preview_selectors = [
-                    '.msg-conversation-card__message-snippet',
-                    '.msg-conversation-listitem__message-snippet',
-                    'p[class*="message-snippet"]'
-                ]
-                
-                recent_message = None
-                for selector in message_preview_selectors:
-                    try:
-                        preview_element = card.locator(selector)
-                        if await preview_element.count() > 0:
-                            recent_message = await preview_element.text_content()
-                            recent_message = truncate_text(recent_message, 40)  # Truncate message
-                            if recent_message:
-                                break
-                    except Exception:
-                        continue
-                
-                # Check if it's a group conversation
-                participant_count = len(name.split(',')) if name else 1
-                is_group = participant_count > 1
-                
-                # Check for pending invites
-                pending_invite = card.locator('.msg-conversation-card__invite-pending-status')
-                has_pending = await pending_invite.count() > 0
-                
-                conversation = {
+                # Store only the essential preview info
+                message_data = {
                     "name": name,
-                    "unread": has_unread,
-                    "last_message_time": last_message_time.strip() if last_message_time else None,
-                    "recent_message": recent_message,
-                    "index": i,
-                    "selectors": {
-                        "card": ".msg-conversation-card",
-                        "name": name_selectors[0]
-                    },
-                    "metadata": {
-                        "is_group": is_group,
-                        "participant_count": participant_count,
-                        "has_pending_invites": has_pending,
-                        "truncated": True,  # Flag to indicate data is pre-truncated
-                        "name_max_length": 25,
-                        "message_max_length": 40
-                    }
+                    "last_message_time": last_message_time,
+                    "preview": preview_text
                 }
                 
-                result["conversations"].append(conversation)
-                print(f"[Fetch] Found conversation: {name}")
+                result["messages"].append(message_data)
+                logger.info(f"Gathered message preview for: {name}")
                 
             except Exception as e:
-                print(f"[Warning] Error processing conversation {i}: {str(e)}")
+                logger.error(f"Error gathering message preview: {str(e)}")
                 continue
         
-        # Update summary with both total and processed counts
-        result["summary"].update({
-            "total_available": total_count,
-            "total_processed": len(result["conversations"]),
-            "unread_count": unread_count,
-            "limit_reached": total_count > limit
-        })
-        
-        # Save to file for future use
-        with open('conversation_list.json', 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        
-        print(f"[Fetch] Processed {len(result['conversations'])} out of {total_count} conversations ({unread_count} unread)")
-        if total_count > limit:
-            print(f"[Fetch] Note: {total_count - limit} conversations were not processed due to limit")
-        return result
+        return response_model(result=result)
         
     except Exception as e:
-        print(f"[Error] Failed to fetch conversation list: {str(e)}")
-        await page.screenshot(path="error_messaging_page.png")
-        print("[Error] Debug screenshot saved as error_messaging_page.png")
-        return result
+        logger.error(f"Error in fetch_profile_in_message: {str(e)}")
+        return response_model(error=str(e), success=False)
 
-async def run():
+async def enter_conversation_directly(ctx: BrowserContext, target_name: str) -> ResponseMessage[bool]:
+    """
+    Enters a specific conversation based on the contact name.
+    
+    Workflow:
+    1. First use fetch_profile_in_message() to get list of conversations
+    2. Find the exact conversation by matching the target_name
+    3. Enter that specific conversation
+    
+    Args:
+        ctx (BrowserContext): Browser context
+        target_name (str): Exact name of the contact to chat with (must match the name from fetch_profile_in_message)
+        
+    Returns:
+        ResponseMessage[bool]: Success/failure status with error message if failed
+    """
+    response_model = ResponseMessage[bool]
+    
+    if not await check_authorization(ctx):
+        return response_model(error="User is not authorized.", success=False)
+    
     try:
-        await browser.start()
-        print("Browser started")
+        # First get the list of conversations
+        conversations_result = await fetch_profile_in_message(ctx)
+        if not conversations_result.success:
+            return response_model(error=f"Failed to fetch conversations: {conversations_result.error}", success=False)
         
-        await navigate_to_linkedln(browser)
-        print("Navigated to LinkedIn")
+        # Find the matching conversation
+        target_conversation = None
+        target_index = -1
         
-        print("Running... Press Ctrl+C to shutdown")
+        for idx, msg in enumerate(conversations_result.result["messages"]):
+            if msg["name"].strip() == target_name.strip():
+                target_conversation = msg
+                target_index = idx
+                break
         
-        # if not await is_logged_in(browser):
-        #     print("Signing in...")
-        #     await auto_sign_in(browser)
-        #     print("Sign in completed")
+        if target_conversation is None:
+            return response_model(
+                error=f"Could not find conversation with contact: {target_name}. Please verify the exact name from the conversation list.", 
+                success=False
+            )
         
-        # # Direct conversation entry without profile fetching
-        await navigate_to_messaging(browser)
-        
-        # First fetch the conversation list
-        print("\nFetching conversation list...")
-        conversations = await fetch_conversation_list(browser)
-        
-        if not conversations or not conversations.get("conversations"):
-            print("[Error] Failed to fetch conversations")
-            return
-            
-        print("\nAvailable conversations:")
-        for conv in conversations["conversations"]:
-            unread = "🔵" if conv["unread"] else "  "
-            time = conv["last_message_time"] or "no time"
-            message = conv["recent_message"] or "no preview"
-            
-            # Print conversation header with name and time
-            print(f"{unread} {conv['name']:<25} ({time})")
-            print(f"    └─ {message}")
-            print()
-        
-        # Example: Search for a specific conversation
-        print("\nSearching for a specific conversation...")
-        partipant_name = input("\n[Input] Enter name to search for (or press Enter to exit): ")
-        if not partipant_name:
-            print("\nExiting...")
-            await browser.close()
-            return
-        
-        # Verify the conversation list file exists and is valid before searching
-        try:
-            with open('conversation_list.json', 'r', encoding='utf-8') as f:
-                saved_data = json.load(f)
-                if not saved_data.get("conversations"):
-                    print("[Error] Invalid conversation data, fetching again...")
-                    conversations = await fetch_conversation_list(browser)
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("[Error] Conversation data not found or invalid, fetching again...")
-            conversations = await fetch_conversation_list(browser)
-        
-        matches = await filter_threads_by_name(partipant_name)
-        
-        if matches:
-            try:
-                print(f"\n[Action] Entering conversation with {matches[0]['name']}...")
-                if await enter_conversation_directly(browser, matches):
-                    print("[Ready] Conversation is ready for interaction")
-                else:
-                    print("[Error] Failed to enter conversation")
-            except ValueError as e:
-                print(f"[Error] {str(e)}")
-        else:
-            print(f"[Info] No conversations found with '{partipant_name}'")
+        page = await ctx.get_current_page()
         
         try:
-            while True:
-                await asyncio.sleep(1)
-        except KeyboardInterrupt:
-            print("\nShutting down")
-            await browser.close()
+            # Ensure we're on messaging page
+            messaging_container = page.locator('div.msg-overlay-list-bubble')
+            if not await messaging_container.is_visible():
+                logger.info("Opening messaging overlay...")
+                await page.goto('https://www.linkedin.com/messaging/')
+                await messaging_container.wait_for(state="visible", timeout=10000)
+            
+            logger.info(f"Attempting to enter conversation with: {target_name}")
+            
+            # Locate the conversation card
+            conversation_cards = page.locator('.msg-conversation-card')
+            count = await conversation_cards.count()
+            
+            if count == 0:
+                logger.info("No conversations visible, checking alternative selectors...")
+                alternative_selectors = [
+                    'li.msg-conversation-listitem',
+                    '.msg-conversation-listitem__link',
+                    '.msg-selectable-entity'
+                ]
+                
+                for selector in alternative_selectors:
+                    conversation_cards = page.locator(selector)
+                    count = await conversation_cards.count()
+                    if count > 0:
+                        logger.info(f"Found conversations using: {selector}")
+                        break
+            
+            if target_index >= count:
+                return response_model(
+                    error=f"Conversation index {target_index} out of range (total: {count})", 
+                    success=False
+                )
+                
+            # Get the specific conversation card
+            card = conversation_cards.nth(target_index)
+            
+            # Verify we're clicking the right conversation
+            name_element = card.locator('.msg-conversation-card__participant-names')
+            if await name_element.count() > 0:
+                actual_name = await name_element.text_content()
+                actual_name = actual_name.strip()
+                if actual_name != target_name:
+                    return response_model(
+                        error=f"Name mismatch: Expected '{target_name}', found '{actual_name}'",
+                        success=False
+                    )
+            
+            # Click the conversation
+            logger.info("Entering conversation...")
+            await card.click()
+            await page.wait_for_url("**/messaging/thread/**", timeout=5000)
+            
+            logger.info(f"Successfully entered conversation with {target_name}")
+            return response_model(result=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to enter conversation: {str(e)}")
+            return response_model(error=str(e), success=False)
             
     except Exception as e:
-        print(f"\nError: {str(e)}")
-        await browser.close()
+        logger.error(f"Error in enter_conversation_directly: {str(e)}")
+        return response_model(error=str(e), success=False)
 
-def main():
-    asyncio.run(run())
-
-main()
