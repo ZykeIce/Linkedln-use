@@ -22,8 +22,11 @@ import openai
 from browser_use.browser.context import BrowserContextConfig
 from browser_use import BrowserSession, BrowserProfile, BrowserConfig
 import xml.etree.ElementTree as ET
+import shutil
+import json
 
-BROWSER_PROFILE_DIR = "/storage/browser-profiles"
+# Use a more persistent location for browser profiles
+BROWSER_PROFILE_DIR = os.path.expanduser("~/.linkedin-browser-profile")
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +136,9 @@ async def lifespan(app: fastapi.FastAPI):
     os.makedirs('/tmp/.X11-unix', exist_ok=True)
     os.makedirs('/tmp/.ICE-unix', exist_ok=True)    
 
+    # Create browser profile directory if it doesn't exist
     os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
-    logger.info(f"Created {BROWSER_PROFILE_DIR}: {os.path.exists(BROWSER_PROFILE_DIR)}")
+    logger.info(f"Using browser profile directory: {BROWSER_PROFILE_DIR}")
 
     tasks = []
     
@@ -177,24 +181,6 @@ async def lifespan(app: fastapi.FastAPI):
         )
     ))
     
-    for file in ["SingletonLock", "SingletonCookie", "SingletonSocket", "Local State", "Last Version"]:
-        path = os.path.join(BROWSER_PROFILE_DIR, file)
-
-        # check if the path is symlink
-        if os.path.islink(path):
-            # remove the original file
-            reference_path = os.readlink(path)
-            os.unlink(path)
-            
-            try:
-                os.remove(reference_path)
-            except FileNotFoundError:
-                logger.warning(f"Reference file {reference_path} not found, skipping removal.")
-
-        elif os.path.exists(path):
-            logger.info(f"Removing {path}")
-            os.remove(path)
-            
     try:
         browser = BrowserSession(
             config=BrowserConfig(
@@ -202,7 +188,7 @@ async def lifespan(app: fastapi.FastAPI):
                 user_data_dir=BROWSER_PROFILE_DIR,
                 new_context_config=BrowserContextConfig(
                     allowed_domains=["linkedin.com", "www.linkedin.com"],
-                    cookies_file=None,
+                    cookies_file=os.path.join(BROWSER_PROFILE_DIR, "cookies.json"),
                     maximum_wait_page_load_time=5,
                     disable_security=False,
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
@@ -232,9 +218,15 @@ async def lifespan(app: fastapi.FastAPI):
         logger.error(traceback.format_exc())
 
     finally:
-
         if _GLOBALS.get('browser_context'):
             try:
+                # Save cookies before closing
+                current_page = await _GLOBALS['browser_context'].get_current_page()
+                cookies = await current_page.context.cookies()
+                cookies_file = os.path.join(BROWSER_PROFILE_DIR, "cookies.json")
+                with open(cookies_file, 'w') as f:
+                    json.dump(cookies, f)
+                
                 await _GLOBALS['browser_context'].__aexit__(None, None, None)
             except Exception as err:
                 logger.error(f"Exception raised while closing browser context: {err}", stack_info=True)

@@ -118,7 +118,7 @@ async def get_context_aware_available_toolcalls(ctx: BrowserContext):
         return [tool for tool in toolcalls if tool['function']['name'] != 'sign_out']
     else:
         # Return only sign_out and check_login_status when not authorized
-        allowed_unauthorized = ['sign_out', 'check_login_status', 'read_full_conversation']
+        allowed_unauthorized = ['sign_out', 'check_login_status']
         return [tool for tool in toolcalls if tool['function']['name'] in allowed_unauthorized]
 
 async def execute_toolcall(
@@ -165,38 +165,86 @@ async def get_current_user_identity(
     user_identity = await element.get_attribute('alt')
     return response_model(result=user_identity)
 
-async def read_full_conversation(ctx: BrowserContext) -> ResponseMessage[list[str]]:
+import re
+from datetime import datetime, timedelta
+
+async def read_full_conversation(ctx: BrowserContext) -> ResponseMessage[list[dict]]:
     """
-    Reads all messages in the currently open LinkedIn conversation thread.
+    Reads all messages in the currently open LinkedIn conversation thread,
+    capturing sender, message text, and specific datetime (from date separators + per-message time).
     """
-    response_model = ResponseMessage[list[str]]
-    
+    response_model = ResponseMessage[list[dict]]
+
     if not await check_authorization(ctx):
         return response_model(error="User is not authorized.", success=False)
-    
+
     try:
         page = await ctx.get_current_page()
-        
-        # 1) Wait until at least one bubble appears
-        await page.wait_for_selector(
-            "div.msg-s-event-listitem__message-bubble p",
-            timeout=15_000
-        )
+        await page.wait_for_selector("li.msg-s-message-list__event", timeout=15_000)
 
-        # 2) Grab all <p> under those bubble divs
-        elems = await page.query_selector_all(
-            "div.msg-s-event-listitem__message-bubble p"
-        )
+        # All message blocks (date dividers + bubbles)
+        events = await page.query_selector_all("li.msg-s-message-list__event")
 
-        # 3) Extract their text
-        messages = []
-        for el in elems:
-            txt = (await el.inner_text()).strip()
-            if txt:
-                messages.append(txt)
+        results = []
+        current_date = None
+        last_time = None
 
-        return response_model(result=messages)
-            
+        for event in events:
+            # Check if this is a date divider
+            date_el = await event.query_selector("span.msg-s-date-divider__date")
+            if date_el:
+                raw_date = (await date_el.inner_text()).strip()
+
+                # Parse date string
+                today = datetime.now()
+                if raw_date.lower() == "today":
+                    current_date = today.date()
+                elif raw_date.lower() == "yesterday":
+                    current_date = (today - timedelta(days=1)).date()
+                else:
+                    try:
+                        current_date = datetime.strptime(raw_date, "%b %d").replace(year=today.year).date()
+                    except ValueError:
+                        current_date = None
+                continue
+
+            # Find all message bubbles in this block
+            bubbles = await event.query_selector_all("div.msg-s-event-listitem__message-bubble")
+            for bubble in bubbles:
+                # Message text
+                text_el = await bubble.query_selector("p")
+                text = (await text_el.inner_text()).strip() if text_el else ""
+
+                # Sender
+                parent = await bubble.evaluate_handle("node => node.parentElement")
+                class_list = await parent.evaluate("node => node.className")
+                sender = "them" if "msg-s-event-listitem--other" in class_list else "me"
+
+                # Time (if any)
+                timestamp_el = await bubble.query_selector("span.msg-s-message-group__timestamp")
+                time_str = (await timestamp_el.inner_text()).strip() if timestamp_el else None
+                if time_str:
+                    last_time = time_str
+
+                # Combine current_date + last_time
+                if current_date and last_time:
+                    try:
+                        full_datetime = datetime.strptime(f"{current_date} {last_time}", "%Y-%m-%d %I:%M %p")
+                        datetime_str = full_datetime.isoformat()
+                    except Exception:
+                        datetime_str = None
+                else:
+                    datetime_str = None
+
+                if text:
+                    results.append({
+                        "sender": sender,
+                        "text": text,
+                        "datetime": datetime_str
+                    })
+
+        return response_model(result=results)
+
     except PlaywrightTimeoutError:
         return response_model(error="Timeout waiting for messages to load", success=False)
     except Exception as e:
@@ -237,6 +285,12 @@ async def fetch_profile_in_message(ctx: BrowserContext) -> ResponseMessage[dict]
                 "fetch_time": datetime.now().isoformat()
             }
         }
+        
+        # Check if we're already on the messaging page
+        current_url = page.url
+        if not current_url.startswith('https://www.linkedin.com/messaging'):
+            logger.info("Navigating to messaging page...")
+            await page.goto('https://www.linkedin.com/messaging/')
         
         # Wait for the messaging overlay
         messaging_container = page.locator('div.msg-overlay-list-bubble')
@@ -408,4 +462,3 @@ async def enter_conversation_directly(ctx: BrowserContext, target_name: str) -> 
     except Exception as e:
         logger.error(f"Error in enter_conversation_directly: {str(e)}")
         return response_model(error=str(e), success=False)
-
